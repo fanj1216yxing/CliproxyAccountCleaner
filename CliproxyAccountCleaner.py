@@ -53,6 +53,7 @@ DEFAULT_QUOTA_THRESHOLD = 95
 DEFAULT_OUTPUT = "invalid_codex_accounts.json"
 DEFAULT_QUOTA_OUTPUT = "invalid_quota_accounts.json"
 DEFAULT_ACTIVE_QUOTA_OUTPUT = "active_quota_history.jsonl"
+STREAM_ERROR_ACTIVE_MESSAGE = "stream error: stream disconnected before completion: stream closed before response.completed"
 
 
 def load_config(path):
@@ -101,6 +102,21 @@ def extract_chatgpt_account_id(item):
         if val:
             return val
     return None
+
+
+def _is_stream_error_active(raw_status, status_message):
+    if str(raw_status or "").strip().lower() != "error":
+        return False
+
+    parsed = safe_json_text(status_message or "")
+    err = parsed.get("error") if isinstance(parsed, dict) else {}
+    message = ""
+    if isinstance(err, dict):
+        message = str(err.get("message") or "")
+    if not message:
+        message = str(status_message or "")
+
+    return STREAM_ERROR_ACTIVE_MESSAGE in message.lower()
 
 
 def fetch_auth_files(base_url, token, timeout):
@@ -1052,7 +1068,10 @@ class EnhancedUI(tk.Tk):
         for account in self.all_accounts:
             if account.get("disabled"):
                 continue
-            if (account.get("status") or "unknown").lower() != "active":
+            if not (
+                (account.get("status") or "unknown").lower() == "active"
+                or bool(account.get("stream_error_active"))
+            ):
                 continue
 
             used_percent = account.get("used_percent")
@@ -1114,6 +1133,7 @@ class EnhancedUI(tk.Tk):
 
                     raw_status = f.get("status")
                     normalized_status = raw_status or "unknown"
+                    stream_error_active = _is_stream_error_active(raw_status, status_msg)
                     if (
                         is_incremental_refresh
                         and identity
@@ -1140,6 +1160,7 @@ class EnhancedUI(tk.Tk):
                             "name": f.get("name") or "",
                             "account": f.get("account") or f.get("email") or "",
                             "status": normalized_status,
+                            "stream_error_active": stream_error_active,
                             "error_info": error_info,
                             "usage_limit": usage_limit,
                             "auth_index": f.get("auth_index"),
@@ -1176,7 +1197,13 @@ class EnhancedUI(tk.Tk):
 
         total = len(accounts)
         error_count = len([a for a in accounts if (a.get("status") or "").lower() == "error"])
-        active_count = len([a for a in accounts if (a.get("status") or "").lower() == "active"])
+        active_count = len(
+            [
+                a
+                for a in accounts
+                if (a.get("status") or "").lower() == "active" or bool(a.get("stream_error_active"))
+            ]
+        )
         unknown_count = len([a for a in accounts if (a.get("status") or "unknown").lower() in ("unknown", "")])
         closed_count = len([a for a in accounts if bool(a.get("disabled"))])
 
@@ -1266,7 +1293,9 @@ class EnhancedUI(tk.Tk):
         for account in self.all_accounts:
             if status_filter == "错误" and account.get("status") != "error":
                 continue
-            if status_filter == "活跃" and account.get("status") != "active":
+            if status_filter == "活跃" and not (
+                account.get("status") == "active" or account.get("stream_error_active")
+            ):
                 continue
             if status_filter == "未知" and account.get("status") not in ["unknown", ""]:
                 continue
