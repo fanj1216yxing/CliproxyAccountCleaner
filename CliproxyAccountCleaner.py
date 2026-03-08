@@ -9,6 +9,7 @@ Enhanced UI:
 
 import os
 import sys
+import argparse
 import json
 import asyncio
 import threading
@@ -16,12 +17,19 @@ import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
-import tkinter as tk
-from tkinter import ttk, messagebox
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+except Exception:
+    tk = None
+    ttk = None
+    messagebox = None
 import requests
 import aiohttp
 
 HERE = os.path.abspath(os.path.dirname(__file__))
+_TK_BASE = tk.Tk if tk is not None else object
 
 
 def pick_existing_in(base_dir, *names):
@@ -96,8 +104,11 @@ def _contains_limit_error(value):
 def load_config(path):
     if not os.path.exists(path):
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"config.json 格式错误: {e}")
     if not isinstance(data, dict):
         raise RuntimeError("config.json 顶层必须是对象")
     return data
@@ -194,9 +205,7 @@ def refresh_quota_source(base_url, token, timeout):
     return safe_json(r).get("files") or []
 
 
-def build_usage_payload(auth_index, user_agent, chatgpt_account_id=None):
-    """统一构造 usage 探测请求，避免 401/额度检测各自维护一份相同协议。"""
-
+def build_probe_payload(auth_index, user_agent, chatgpt_account_id=None):
     call_header = {
         "Authorization": "Bearer $TOKEN$",
         "Content-Type": "application/json",
@@ -213,12 +222,50 @@ def build_usage_payload(auth_index, user_agent, chatgpt_account_id=None):
     }
 
 
-def build_probe_payload(auth_index, user_agent, chatgpt_account_id=None):
-    return build_usage_payload(auth_index, user_agent, chatgpt_account_id)
-
-
 def build_quota_payload(auth_index, user_agent, chatgpt_account_id=None):
-    return build_usage_payload(auth_index, user_agent, chatgpt_account_id)
+    call_header = {
+        "Authorization": "Bearer $TOKEN$",
+        "Content-Type": "application/json",
+        "User-Agent": user_agent,
+    }
+    if chatgpt_account_id:
+        call_header["Chatgpt-Account-Id"] = chatgpt_account_id
+
+    return {
+        "authIndex": auth_index,
+        "method": "GET",
+        "url": "https://chatgpt.com/backend-api/wham/usage",
+        "header": call_header,
+    }
+
+
+async def _run_bounded(items, limit, make_coro):
+    """Run async jobs with bounded in-flight tasks.
+    Avoid creating one task per item when item count is huge.
+    """
+    limit = max(1, int(limit or 1))
+    it = iter(items or [])
+    running = set()
+    out = []
+
+    for _ in range(limit):
+        try:
+            item = next(it)
+        except StopIteration:
+            break
+        running.add(asyncio.create_task(make_coro(item)))
+
+    while running:
+        done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            out.append(await task)
+            try:
+                item = next(it)
+            except StopIteration:
+                continue
+            running.add(asyncio.create_task(make_coro(item)))
+
+    return out
 
 
 async def probe_accounts(
@@ -315,11 +362,12 @@ async def probe_accounts(
     client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
     sem = asyncio.Semaphore(max(1, workers))
 
-    out = []
     async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
-        tasks = [asyncio.create_task(probe_one(session, sem, item)) for item in refreshed_candidates]
-        for t in asyncio.as_completed(tasks):
-            out.append(await t)
+        out = await _run_bounded(
+            refreshed_candidates,
+            max(1, workers),
+            lambda item: probe_one(session, sem, item),
+        )
     return out
 
 
@@ -446,6 +494,9 @@ async def check_quota_accounts(
                         if sc == 200:
                             body = data.get("body", "")
                             usage_data = as_json_obj(body)
+
+                            # Debug: capture raw response
+                            result["raw_response"] = body
 
                             rate_limit = usage_data.get("rate_limit") or usage_data.get("rateLimit") or {}
 
@@ -642,11 +693,12 @@ async def check_quota_accounts(
     client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
     sem = asyncio.Semaphore(max(1, workers))
 
-    out = []
     async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
-        tasks = [asyncio.create_task(quota_one(session, sem, item)) for item in refreshed_candidates]
-        for t in asyncio.as_completed(tasks):
-            out.append(await t)
+        out = await _run_bounded(
+            refreshed_candidates,
+            max(1, workers),
+            lambda item: quota_one(session, sem, item),
+        )
     return out
 
 
@@ -690,11 +742,12 @@ async def set_disabled_names(base_url, token, names, disabled, workers, timeout)
     client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
     sem = asyncio.Semaphore(max(1, workers))
 
-    out = []
     async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
-        tasks = [asyncio.create_task(set_one(session, sem, n)) for n in names]
-        for t in asyncio.as_completed(tasks):
-            out.append(await t)
+        out = await _run_bounded(
+            names,
+            max(1, workers),
+            lambda n: set_one(session, sem, n),
+        )
     return out
 
 
@@ -724,16 +777,19 @@ async def delete_names(base_url, token, names, delete_workers, timeout):
     client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
     sem = asyncio.Semaphore(max(1, delete_workers))
 
-    out = []
     async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
-        tasks = [asyncio.create_task(delete_one(session, sem, n)) for n in names]
-        for t in asyncio.as_completed(tasks):
-            out.append(await t)
+        out = await _run_bounded(
+            names,
+            max(1, delete_workers),
+            lambda n: delete_one(session, sem, n),
+        )
     return out
 
 
-class EnhancedUI(tk.Tk):
+class EnhancedUI(_TK_BASE):
     def __init__(self, conf, config_path):
+        if tk is None:
+            raise RuntimeError("当前环境缺少 tkinter，无法启动桌面模式。")
         super().__init__()
         self.title("CliproxyAccountCleaner v1.3.3")
         self.geometry("1220x760")
@@ -746,7 +802,6 @@ class EnhancedUI(tk.Tk):
         self._compact_usage_mode = False
         self._layout_update_job = None
         self._on_help_page = False
-        self._config_save_job = None
 
         self._init_config_vars()
         self._setup_styles()
@@ -947,21 +1002,21 @@ class EnhancedUI(tk.Tk):
         self.auto_status_var = tk.StringVar(value="自动巡检状态：未启动")
         ttk.Label(auto, textvariable=self.auto_status_var, style="Subtle.TLabel").pack(side="left", pady=(7, 0))
 
-        self.auto_interval_var.trace_add("write", lambda *_: self._schedule_save_config())
-        self.auto_401_action_var.trace_add("write", lambda *_: self._schedule_save_config())
-        self.auto_quota_action_var.trace_add("write", lambda *_: self._schedule_save_config())
-        self.auto_enabled_var.trace_add("write", lambda *_: self._schedule_save_config())
-        self.auto_keep_active_var.trace_add("write", lambda *_: self._schedule_save_config())
-        self.auto_allow_closed_scan_var.trace_add("write", lambda *_: self._schedule_save_config())
+        self.auto_interval_var.trace_add("write", lambda *_: self._save_config())
+        self.auto_401_action_var.trace_add("write", lambda *_: self._save_config())
+        self.auto_quota_action_var.trace_add("write", lambda *_: self._save_config())
+        self.auto_enabled_var.trace_add("write", lambda *_: self._save_config())
+        self.auto_keep_active_var.trace_add("write", lambda *_: self._save_config())
+        self.auto_allow_closed_scan_var.trace_add("write", lambda *_: self._save_config())
 
         # 运行参数改动后也持久化到 config.json
-        self.base_url_var.trace_add("write", lambda *_: self._schedule_save_config())
-        self.token_var.trace_add("write", lambda *_: self._schedule_save_config())
-        self.workers_var.trace_add("write", lambda *_: self._schedule_save_config())
-        self.quota_workers_var.trace_add("write", lambda *_: self._schedule_save_config())
-        self.delete_workers_var.trace_add("write", lambda *_: self._schedule_save_config())
-        self.weekly_quota_threshold_var.trace_add("write", lambda *_: self._schedule_save_config())
-        self.primary_quota_threshold_var.trace_add("write", lambda *_: self._schedule_save_config())
+        self.base_url_var.trace_add("write", lambda *_: self._save_config())
+        self.token_var.trace_add("write", lambda *_: self._save_config())
+        self.workers_var.trace_add("write", lambda *_: self._save_config())
+        self.quota_workers_var.trace_add("write", lambda *_: self._save_config())
+        self.delete_workers_var.trace_add("write", lambda *_: self._save_config())
+        self.weekly_quota_threshold_var.trace_add("write", lambda *_: self._save_config())
+        self.primary_quota_threshold_var.trace_add("write", lambda *_: self._save_config())
 
         filter_frame = ttk.LabelFrame(self.main_content, text="筛选与搜索", style="Card.TLabelframe", padding=(8, 5))
         filter_frame.pack(fill="x", pady=(0, 2))
@@ -1214,18 +1269,7 @@ class EnhancedUI(tk.Tk):
             s = s[:-1]
         return s
 
-    def _schedule_save_config(self):
-        """输入过程中做防抖保存，避免每按一个键就写盘。"""
-
-        if self._config_save_job is not None:
-            try:
-                self.after_cancel(self._config_save_job)
-            except Exception:
-                pass
-        self._config_save_job = self.after(400, self._save_config)
-
     def _save_config(self):
-        self._config_save_job = None
         try:
             # 基础运行参数
             self.conf["base_url"] = self._normalize_base_url(self.base_url_var.get())
@@ -1305,8 +1349,7 @@ class EnhancedUI(tk.Tk):
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(self.conf, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            # 配置自动保存失败时仅写状态栏，避免用户输入过程中被反复弹窗打断。
-            self.status_bar.set(f"配置自动保存失败：{e}")
+            messagebox.showwarning("保存配置失败", f"配置未写入 config.json:\n{e}")
 
     def _normalize_token(self, raw):
         s = str(raw or "").strip()
@@ -1318,27 +1361,6 @@ class EnhancedUI(tk.Tk):
             return True
         messagebox.showinfo(action_name, "当前账号列表为空，请先点击“刷新”并确保加载成功。")
         return False
-
-    def _parse_int_input(self, label, raw_value, default_value=None, min_value=None, max_value=None):
-        """统一做数值输入校验，避免运行时直接抛 ValueError。"""
-
-        text = str(raw_value or "").strip()
-        if text == "":
-            if default_value is not None:
-                value = int(default_value)
-            else:
-                raise RuntimeError(f"{label} 不能为空")
-        else:
-            try:
-                value = int(text)
-            except Exception:
-                raise RuntimeError(f"{label} 必须是整数")
-
-        if min_value is not None and value < min_value:
-            raise RuntimeError(f"{label} 不能小于 {min_value}")
-        if max_value is not None and value > max_value:
-            raise RuntimeError(f"{label} 不能大于 {max_value}")
-        return value
 
     def _runtime(self):
         base_url = self._normalize_base_url(self.base_url_var.get())
@@ -1353,39 +1375,26 @@ class EnhancedUI(tk.Tk):
         if any(ord(ch) > 255 for ch in token):
             raise RuntimeError("令牌中包含非英文字符，请检查是否混入中文标点（如 。）")
 
-        workers = self._parse_int_input("401 检测并发", self.workers_var.get(), DEFAULT_WORKERS, min_value=1)
-        quota_workers = self._parse_int_input("额度检测并发", self.quota_workers_var.get(), DEFAULT_QUOTA_WORKERS, min_value=1)
-        delete_workers = self._parse_int_input("删除并发", self.delete_workers_var.get(), DEFAULT_DELETE_WORKERS, min_value=1)
-        weekly_quota_threshold = self._parse_int_input(
-            "周额度阈值 (%)", self.weekly_quota_threshold_var.get(), DEFAULT_QUOTA_THRESHOLD, min_value=0, max_value=100
-        )
-        primary_quota_threshold = self._parse_int_input(
-            "5 小时额度阈值 (%)", self.primary_quota_threshold_var.get(), DEFAULT_QUOTA_THRESHOLD, min_value=0, max_value=100
-        )
-        auto_keep_active_count = self._parse_int_input(
-            "活跃账号目标数", self.auto_keep_active_var.get(), 0, min_value=0
-        )
-
         return {
             "base_url": base_url,
             "token": token,
             "timeout": int(self.conf.get("timeout") or DEFAULT_TIMEOUT),
-            "workers": workers,
-            "quota_workers": quota_workers,
+            "workers": int(self.workers_var.get() or DEFAULT_WORKERS),
+            "quota_workers": int(self.quota_workers_var.get() or DEFAULT_QUOTA_WORKERS),
             "close_workers": int(self.conf.get("close_workers") or DEFAULT_CLOSE_WORKERS),
             "enable_workers": int(self.conf.get("enable_workers") or DEFAULT_ENABLE_WORKERS),
-            "delete_workers": delete_workers,
+            "delete_workers": int(self.delete_workers_var.get() or DEFAULT_DELETE_WORKERS),
             "retries": int(self.conf.get("retries") or DEFAULT_RETRIES),
             "user_agent": self.conf.get("user_agent") or DEFAULT_UA,
             "chatgpt_account_id": self.conf.get("chatgpt_account_id") or None,
             "target_type": (self.conf.get("target_type") or DEFAULT_TARGET_TYPE).lower(),
             "provider": (self.conf.get("provider") or "").lower(),
-            "weekly_quota_threshold": weekly_quota_threshold,
-            "primary_quota_threshold": primary_quota_threshold,
+            "weekly_quota_threshold": int(self.weekly_quota_threshold_var.get() or DEFAULT_QUOTA_THRESHOLD),
+            "primary_quota_threshold": int(self.primary_quota_threshold_var.get() or DEFAULT_QUOTA_THRESHOLD),
             "output": self.conf.get("output") or DEFAULT_OUTPUT,
             "quota_output": self.conf.get("quota_output") or DEFAULT_QUOTA_OUTPUT,
             "active_quota_output": self.conf.get("active_quota_output") or DEFAULT_ACTIVE_QUOTA_OUTPUT,
-            "auto_keep_active_count": auto_keep_active_count,
+            "auto_keep_active_count": max(0, int(self.auto_keep_active_var.get() or 0)),
             "auto_allow_scan_closed": bool(self.auto_allow_closed_scan_var.get()),
             "auto_action_401": self.auto_401_action_var.get(),
             "auto_action_quota": self.auto_quota_action_var.get(),
@@ -4514,9 +4523,23 @@ class EnhancedUI(tk.Tk):
 
 
 def main():
-    conf = load_config(CONFIG_PATH)
-    app = EnhancedUI(conf, CONFIG_PATH)
-    app.mainloop()
+    parser = argparse.ArgumentParser(description="CliproxyAccountCleaner")
+    parser.add_argument("--desktop", action="store_true", help="使用桌面模式(Tkinter)")
+    parser.add_argument("--host", default="127.0.0.1", help="网页模式监听地址")
+    parser.add_argument("--port", type=int, default=8765, help="网页模式端口")
+    parser.add_argument("--no-browser", action="store_true", help="网页模式启动时不自动打开浏览器")
+    args = parser.parse_args()
+
+    if args.desktop:
+        if tk is None:
+            raise RuntimeError("当前环境缺少 tkinter，无法启动桌面模式。请改用网页模式或安装 Tk 运行时。")
+        conf = load_config(CONFIG_PATH)
+        app = EnhancedUI(conf, CONFIG_PATH)
+        app.mainloop()
+        return
+
+    from cliproxy_web_mode import run_web_mode
+    run_web_mode(host=args.host, port=args.port, no_browser=args.no_browser, ns=globals())
 
 
 if __name__ == "__main__":
@@ -4524,4 +4547,5 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         print(f"[启动失败] {e}", file=sys.stderr)
+        input("按回车退出...")
         raise

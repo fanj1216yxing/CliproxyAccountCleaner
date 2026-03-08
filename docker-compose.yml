@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  cliproxy-account-cleaner:
+    build: .
+    container_name: cliproxy-account-cleaner
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./config.json:/app/config.json
+      - ./data:/data
+    restart: unless-stopped
+    command: ["python", "CliproxyAccountCleaner.py", "--host", "0.0.0.0", "--port", "8765", "--no-browser"]
+

@@ -1,10 +1,13 @@
+.git
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .pytest_cache/
-
+*.log
 _run_err.log
 _run_out.log
-*.log
+README.md
+LICENSE
+一键检测401和额度并删除.bat
 
